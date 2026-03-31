@@ -5,8 +5,8 @@
 // CENTRALIZED PIN CONFIGURATION
 // ==========================================
 // Actuators
-const int PUMP_PIN   = 3;  // PWM - Water pump (Moved to D3)
-const int LED_PIN    = 4;  // PWM/Dig - Status LED
+const int PUMP_PIN   = 4;  // PWM - Water pump (Moved to D3)
+const int LED_PIN    = 3;  // PWM/Dig - Status LED
 const int BUZZER_PIN = 5;  // PWM/Dig - Startup Buzzer
 
 // Sensors & Inputs (Grove Beginner Kit: pot on A0; moisture on A2 via Grove cable)
@@ -21,8 +21,8 @@ const unsigned long PAUSE_HOLD_MS = 4000;
 // Hysteresis around threshold (ADC counts) stops REFILL/WATER OK chatter and OLED flicker
 const int MOISTURE_HYST = 45;
 
-// Slow loop: sensors, pump, OLED (ms)
-const unsigned long SENSOR_PERIOD_MS = 500;
+// Sensor/control loop period (ms). Lower value = faster response.
+const unsigned long SENSOR_PERIOD_MS = 200;
 
 // Fast poll for button edges (ms)
 const unsigned long BUTTON_POLL_MS = 15;
@@ -119,6 +119,8 @@ void setup() {
 void loop() {
   static unsigned long lastSensorMs = 0;
   static bool lowWater = false; // Schmitt state: need refill
+  static bool firstSample = true;
+  static int moistureFiltered = 0;
 
   unsigned long now = millis();
   pollPauseButton();
@@ -129,19 +131,34 @@ void loop() {
     int moistureLevel = analogRead(MOISTURE_SENSOR_PIN);
     int threshold = analogRead(POT_PIN);
 
-    // Schmitt trigger vs. pot threshold — stable pump/display, no flicker
+    // Simple low-pass filter to smooth out fast spikes from the sensor.
+    if (firstSample) {
+      moistureFiltered = moistureLevel;
+      firstSample = false;
+    } else {
+      // 1/2 previous value, 1/2 new reading (faster response than 3/4 + 1/4)
+      moistureFiltered = (moistureFiltered + moistureLevel) / 2;
+    }
+
+    // Schmitt trigger vs. pot threshold — stable pump/display, no flicker.
+    // NOTE: Lower moistureFiltered than threshold means sensor is IN water.
+    //       Higher moistureFiltered than threshold means sensor is OUT of water.
     if (lowWater) {
-      if (moistureLevel > threshold + MOISTURE_HYST) {
+      // Currently in "need refill" state; only clear it once sensor is clearly back in water.
+      if (moistureFiltered < threshold - MOISTURE_HYST) {
         lowWater = false;
       }
     } else {
-      if (moistureLevel < threshold - MOISTURE_HYST) {
+      // Currently "water OK"; only enter refill state once sensor is clearly out of water.
+      if (moistureFiltered > threshold + MOISTURE_HYST) {
         lowWater = true;
       }
     }
 
-    Serial.print("Moisture: ");
+    Serial.print("Moisture raw: ");
     Serial.print(moistureLevel);
+    Serial.print(" | filt: ");
+    Serial.print(moistureFiltered);
     Serial.print(" | Thresh: ");
     Serial.print(threshold);
     Serial.print(" | Paused: ");
