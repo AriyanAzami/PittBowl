@@ -38,6 +38,12 @@ bool prevButtonDown = false;
 unsigned long buttonPressStartMs = 0;
 bool longPressHandled = false;
 
+static void beepBuzzer(unsigned int freqHz, unsigned int durationMs) {
+  tone(BUZZER_PIN, freqHz, durationMs);
+  delay(durationMs + 20);
+  noTone(BUZZER_PIN);
+}
+
 static void pollPauseButton() {
   bool down = digitalRead(BUTTON_PIN) == HIGH;
   if (down && !prevButtonDown) {
@@ -49,9 +55,8 @@ static void pollPauseButton() {
     if (held >= PAUSE_HOLD_MS) {
       systemPaused = !systemPaused;
       longPressHandled = true;
-      digitalWrite(BUZZER_PIN, HIGH);
-      delay(80);
-      digitalWrite(BUZZER_PIN, LOW);
+      // Longer, audible beep for pause/resume toggle feedback.
+      beepBuzzer(2200, 180);
     }
   }
   if (!down && prevButtonDown) {
@@ -99,10 +104,8 @@ void setup() {
   // Button was pressed!
   Serial.println("Button pressed. Starting system...");
 
-  // Sound the buzzer (short beep)
-  digitalWrite(BUZZER_PIN, HIGH);
-  delay(300);
-  digitalWrite(BUZZER_PIN, LOW);
+  // Startup confirmation beep (audible on Grove buzzer).
+  beepBuzzer(1800, 300);
 
   // Show Welcome Screen
   u8x8.clearDisplay();
