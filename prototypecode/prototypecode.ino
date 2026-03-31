@@ -9,20 +9,57 @@ const int PUMP_PIN   = 3;  // PWM - Water pump (Moved to D3)
 const int LED_PIN    = 4;  // PWM/Dig - Status LED
 const int BUZZER_PIN = 5;  // PWM/Dig - Startup Buzzer
 
-// Sensors & Inputs
-const int BUTTON_PIN = 6;  // Digital - Startup Button
-const int MOISTURE_SENSOR_PIN = A0; // Analog - Water level detection
-const int LIGHT_SENSOR_PIN    = A6; // Analog - Ambient light / Debris shield detection
+// Sensors & Inputs (Grove Beginner Kit: pot on A0; moisture on A2 via Grove cable)
+const int BUTTON_PIN = 6;       // Digital - Startup Button
+const int POT_PIN = A0;         // Analog - Threshold adjustment
+const int MOISTURE_SENSOR_PIN = A2; // Analog - Water level / moisture
 
-// Thresholds for logic (Tune these as needed when testing)
-const int MOISTURE_THRESHOLD = 400; // Below this = Low Water (0 = dry, 1023 = fully submerged)
-const int LIGHT_THRESHOLD    = 100; // Below this = Dark
+// Long-press: release after >= this many ms toggles pause (drain / resume).
+// Button is polled every BUTTON_POLL_MS; a 500ms-only loop under-counted hold time and broke resume.
+const unsigned long PAUSE_HOLD_MS = 4000;
+
+// Hysteresis around threshold (ADC counts) stops REFILL/WATER OK chatter and OLED flicker
+const int MOISTURE_HYST = 45;
+
+// Slow loop: sensors, pump, OLED (ms)
+const unsigned long SENSOR_PERIOD_MS = 500;
+
+// Fast poll for button edges (ms)
+const unsigned long BUTTON_POLL_MS = 15;
 
 // ==========================================
 // GLOBAL OBJECTS
 // ==========================================
 // Onboard OLED is an SSD1315 (compatible with SSD1306) on the I2C bus
 U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(/* reset=*/ U8X8_PIN_NONE);
+
+bool systemPaused = false;
+bool prevButtonDown = false;
+unsigned long buttonPressStartMs = 0;
+bool longPressHandled = false;
+
+static void pollPauseButton() {
+  bool down = digitalRead(BUTTON_PIN) == HIGH;
+  if (down && !prevButtonDown) {
+    buttonPressStartMs = millis();
+    longPressHandled = false;
+  }
+  if (down && !longPressHandled) {
+    unsigned long held = millis() - buttonPressStartMs;
+    if (held >= PAUSE_HOLD_MS) {
+      systemPaused = !systemPaused;
+      longPressHandled = true;
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(80);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+  if (!down && prevButtonDown) {
+    // Reset gate on release so the next long-press can toggle again.
+    longPressHandled = false;
+  }
+  prevButtonDown = down;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -32,7 +69,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT);
-  
+
   // Ensure actuators are OFF initially
   analogWrite(PUMP_PIN, 0);
   digitalWrite(LED_PIN, LOW);
@@ -54,14 +91,14 @@ void setup() {
   Serial.println("Waiting for button press to start...");
 
   // Wait indefinitely until the button is pressed.
-  // The Grove button modular goes HIGH when pressed.
+  // The Grove button module goes HIGH when pressed.
   while (digitalRead(BUTTON_PIN) == LOW) {
     delay(50); // Small delay to prevent busy-waiting
   }
 
-  // Button was pressed! 
+  // Button was pressed!
   Serial.println("Button pressed. Starting system...");
-  
+
   // Sound the buzzer (short beep)
   digitalWrite(BUZZER_PIN, HIGH);
   delay(300);
@@ -71,53 +108,66 @@ void setup() {
   u8x8.clearDisplay();
   u8x8.drawString(0, 2, "   PittBowl   ");
   u8x8.drawString(0, 4, " Group: NT5T4 ");
-  
+
   delay(3000); // Leave welcome message up for 3 seconds
   u8x8.clearDisplay();
 }
 
 void loop() {
-  // Read Sensors
-  int moistureLevel = analogRead(MOISTURE_SENSOR_PIN);
-  int lightLevel    = analogRead(LIGHT_SENSOR_PIN);
+  static unsigned long lastSensorMs = 0;
+  static bool lowWater = false; // Schmitt state: need refill
 
-  // Output to Serial for debugging monitor
-  Serial.print("Moisture: ");
-  Serial.print(moistureLevel);
-  Serial.print(" | Light: ");
-  Serial.println(lightLevel);
+  unsigned long now = millis();
+  pollPauseButton();
 
-  // Logic: Is the water low?
-  bool isWaterLow = (moistureLevel < MOISTURE_THRESHOLD);
+  if (now - lastSensorMs >= SENSOR_PERIOD_MS) {
+    lastSensorMs = now;
 
-  if (isWaterLow) {
-    // Actuate: LOW WATER
-    analogWrite(PUMP_PIN, 100); // 100/255 speed, as requested in history
-    digitalWrite(LED_PIN, HIGH);
-    
-    // Update display
-    u8x8.drawString(0, 0, " Status:      ");
-    u8x8.drawString(0, 1, " REFILLING... ");
-  } else {
-    // Actuate: ADEQUATE WATER
-    analogWrite(PUMP_PIN, 0); // Turn pump off
-    digitalWrite(LED_PIN, LOW);
-    
-    // Update display
-    u8x8.drawString(0, 0, " Status:      ");
-    u8x8.drawString(0, 1, " WATER OK     ");
+    int moistureLevel = analogRead(MOISTURE_SENSOR_PIN);
+    int threshold = analogRead(POT_PIN);
+
+    // Schmitt trigger vs. pot threshold — stable pump/display, no flicker
+    if (lowWater) {
+      if (moistureLevel > threshold + MOISTURE_HYST) {
+        lowWater = false;
+      }
+    } else {
+      if (moistureLevel < threshold - MOISTURE_HYST) {
+        lowWater = true;
+      }
+    }
+
+    Serial.print("Moisture: ");
+    Serial.print(moistureLevel);
+    Serial.print(" | Thresh: ");
+    Serial.print(threshold);
+    Serial.print(" | Paused: ");
+    Serial.println(systemPaused ? "Y" : "N");
+
+    char line[17];
+
+    if (systemPaused) {
+      analogWrite(PUMP_PIN, 0);
+      digitalWrite(LED_PIN, LOW);
+      snprintf(line, sizeof(line), "%-16s", "Status: PAUSED");
+      u8x8.drawString(0, 2, line);
+    } else if (lowWater) {
+      analogWrite(PUMP_PIN, 100);
+      digitalWrite(LED_PIN, HIGH);
+      snprintf(line, sizeof(line), "%-16s", "Status: REFILL");
+      u8x8.drawString(0, 2, line);
+    } else {
+      analogWrite(PUMP_PIN, 0);
+      digitalWrite(LED_PIN, LOW);
+      snprintf(line, sizeof(line), "%-16s", "Status: WATER OK");
+      u8x8.drawString(0, 2, line);
+    }
+
+    snprintf(line, sizeof(line), "Moist:%4d      ", moistureLevel);
+    u8x8.drawString(0, 0, line);
+    snprintf(line, sizeof(line), "Thresh:%4d     ", threshold);
+    u8x8.drawString(0, 1, line);
   }
 
-  // Display sensor readings on OLED for live tuning
-  u8x8.setCursor(0, 4);
-  u8x8.print("Moist: ");
-  u8x8.print(moistureLevel);
-  u8x8.print("   "); // Clear trailing chars
-
-  u8x8.setCursor(0, 6);
-  u8x8.print("Light: ");
-  u8x8.print(lightLevel);
-  u8x8.print("   ");
-
-  delay(500); // Run loop every half second
+  delay(BUTTON_POLL_MS);
 }
